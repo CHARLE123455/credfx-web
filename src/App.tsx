@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 const API_BASE = "/api/v1";
 
@@ -16,6 +16,7 @@ interface ApiData {
 }
 
 interface UserProfile {
+  createdAt: string;
   id: string;
   email: string;
   firstName: string;
@@ -50,6 +51,12 @@ interface Transaction {
   rateUsed: number;
   status: string;
   createdAt: string;
+  user?: {
+    id: string;
+    email: string;
+    firstName: string;
+    lastName: string;
+  };
 }
 
 interface TransactionList {
@@ -64,7 +71,9 @@ interface AdminUsers {
 
 interface AnalyticsData {
   users: { total: number; verified: number; unverified: number };
-  transactions: { byType: Array<{ type: string; count: string }> };
+  transactions: {
+    byType: Array<{ type: string; count: string }>;
+  };
 }
 
 interface ToastState {
@@ -80,7 +89,20 @@ const apiRequest = async (endpoint: string, options: RequestOptions = {}): Promi
     ...(options.headers ?? {}),
   };
   const res = await fetch(`${API_BASE}${endpoint}`, { ...options, headers });
-  const data = await res.json() as ApiData;
+  const text = await res.text();
+  
+  if (!text || text.trim() === "") {
+    if (!res.ok) throw new Error(`Request failed with status ${res.status}`);
+    return {};
+  }
+
+ let data: ApiData;
+  try {
+    data = JSON.parse(text) as ApiData;
+  } catch {
+    throw new Error("Invalid response from server");
+  }
+
   if (!res.ok) {
     const msg = data.message ?? "Request failed";
     throw new Error(msg);
@@ -630,9 +652,11 @@ const TransactionsPage = () => {
 };
 
 const AdminPage = () => {
-  const [tab, setTab] = useState<"users"|"analytics">("users");
+  const [tab, setTab] = useState<"users"|"analytics"|"fx-trends"|"transactions">("users");
   const [users, setUsers] = useState<AdminUsers | null>(null);
   const [analytics, setAnalytics] = useState<AnalyticsData | null>(null);
+  const [fxTrends, setFxTrends] = useState<Array<{baseCurrency: string; rates: Record<string,number>; fetchedAt: string}>>([]);
+  const [allTx, setAllTx] = useState<TransactionList | null>(null);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<ToastState | null>(null);
   const toast$ = (msg: string, type: "success"|"error" = "success") => { setToast({msg,type}); setTimeout(()=>setToast(null),3500); };
@@ -640,63 +664,343 @@ const AdminPage = () => {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      if (tab==="users") { const r = await api.get("/admin/users?page=1&limit=50"); setUsers(r.data as AdminUsers); }
-      else { const r = await api.get("/admin/analytics/summary"); setAnalytics(r.data as AnalyticsData); }
+      if (tab === "users") {
+        const r = await api.get("/admin/users?page=1&limit=50");
+        setUsers(r.data as AdminUsers);
+      } else if (tab === "analytics") {
+  const [a, tx] = await Promise.all([
+    api.get("/admin/analytics/summary"),
+    api.get("/admin/transactions?limit=100"),
+  ]);
+  const analyticsPayload = a.data as {
+    users: { total: number; verified: number; unverified: number };
+    transactions: { byType: Array<{ type: string; count: string }>; byCurrency: Array<{ currency: string; volume: string; count: string }> };
+    topUsers: Array<{ userId: string; transactionCount: string; totalVolume: string }>;
+  };
+
+  setAnalytics({
+    users: {
+      total: Number(analyticsPayload?.users?.total ?? 0),
+      verified: Number(analyticsPayload?.users?.verified ?? 0),
+      unverified: Number(analyticsPayload?.users?.unverified ?? 0),
+    },
+    transactions: {
+      byType: analyticsPayload?.transactions?.byType ?? [],
+    },
+  });
+
+  const txPayload = tx.data as TransactionList;
+  setAllTx({
+    transactions: txPayload?.transactions ?? [],
+    total: txPayload?.total ?? 0,
+  });
+} else if (tab === "fx-trends") {
+        const r = await api.get("/admin/analytics/fx-trends?base=NGN&limit=20");
+        setFxTrends(r.data as Array<{baseCurrency: string; rates: Record<string,number>; fetchedAt: string}>);
+      }  else if (tab === "transactions") {
+  const tx = await api.get("/admin/transactions?limit=100");
+  setAllTx(tx.data as TransactionList);
+}
     } catch(e) { console.error(e); }
     setLoading(false);
   }, [tab]);
+
   useEffect(() => { void load(); }, [load]);
 
   const toggleRole = async (id: string, currentRole: string) => {
-    const newRole = currentRole==="ADMIN"?"USER":"ADMIN";
-    try { await api.patch(`/admin/users/${id}/role`, { role:newRole }); toast$(`Role updated to ${newRole}`); void load(); }
-    catch(e) { toast$((e as Error).message,"error"); }
+    const newRole = currentRole === "ADMIN" ? "USER" : "ADMIN";
+    try { await api.patch(`/admin/users/${id}/role`, { role: newRole }); toast$(`Role updated to ${newRole}`); void load(); }
+    catch(e) { toast$((e as Error).message, "error"); }
   };
+
+  const tabs = [
+  { id: "users", label: "Users" },
+  { id: "analytics", label: "Analytics" },
+  { id: "fx-trends", label: "FX Trends" },
+  { id: "transactions", label: "All Transactions" },
+] as const;
+
+  const txByType = allTx?.transactions.reduce((acc, tx) => {
+    acc[tx.type] = (acc[tx.type] ?? 0) + 1;
+    return acc;
+  }, {} as Record<string, number>);
+
+  const txByDay = allTx?.transactions.reduce((acc, tx) => {
+    const day = new Date(tx.createdAt).toLocaleDateString("en-GB", { day:"2-digit", month:"short" });
+    acc[day] = (acc[day] ?? 0) + 1;
+    return acc;
+  }, {} as Record<string, number>);
+
+  const recentActivity = allTx?.transactions.slice(0, 8) ?? [];
 
   return (
     <div className="cf-fade">
       {toast && <Toast msg={toast.msg} type={toast.type} onClose={()=>setToast(null)} />}
       <div style={{ marginBottom:28 }}>
         <h1 style={{ fontSize:25,fontWeight:700 }}>Admin Panel</h1>
-        <p style={{ color:"rgba(255,255,255,0.38)",marginTop:4,fontSize:13.5 }}>Platform management & analytics</p>
+        <p style={{ color:"rgba(255,255,255,0.38)",marginTop:4,fontSize:13.5 }}>Platform management, analytics & FX trends</p>
       </div>
-      <div style={{ display:"flex",gap:3,background:"rgba(255,255,255,0.04)",borderRadius:11,padding:3,width:"fit-content",marginBottom:22 }}>
-        {(["users","analytics"] as const).map(t=>(
-          <button key={t} onClick={()=>setTab(t)} style={{ padding:"7px 20px",borderRadius:8,border:"none",cursor:"pointer",background:tab===t?"#E85D04":"transparent",color:tab===t?"white":"rgba(255,255,255,0.38)",fontFamily:"DM Sans,sans-serif",fontSize:13.5,fontWeight:500,textTransform:"capitalize",transition:"all 0.18s" }}>{t}</button>
+
+      <div style={{ display:"flex",gap:3,background:"rgba(255,255,255,0.04)",borderRadius:11,padding:3,width:"fit-content",marginBottom:24 }}>
+        {tabs.map(t => (
+          <button key={t.id} onClick={()=>setTab(t.id)} style={{ padding:"7px 20px",borderRadius:8,border:"none",cursor:"pointer",background:tab===t.id?"#E85D04":"transparent",color:tab===t.id?"white":"rgba(255,255,255,0.38)",fontFamily:"DM Sans,sans-serif",fontSize:13.5,fontWeight:500,transition:"all 0.18s" }}>{t.label}</button>
         ))}
       </div>
-      {loading ? <div style={{ textAlign:"center",padding:60 }}><Spinner /></div>
-      : tab==="users" && users ? (
-        <div className="cf-card" style={{ padding:0,overflow:"hidden" }}>
-          <div style={{ overflowX:"auto" }}>
-            <table className="cf-table">
-              <thead><tr><th>Name</th><th>Email</th><th>Status</th><th>Role</th><th>Joined</th><th>Action</th></tr></thead>
-              <tbody>
-                {users.users?.map(u=>(
-                  <tr key={u.id}>
-                    <td style={{ fontWeight:500 }}>{u.firstName} {u.lastName}</td>
-                    <td style={{ fontSize:12,color:"rgba(255,255,255,0.42)" }}>{u.email}</td>
-                    <td><span className={`cf-badge cf-badge-${u.isVerified?"success":"danger"}`}>{u.isVerified?"Verified":"Unverified"}</span></td>
-                    <td><span className={`cf-badge cf-badge-${u.role==="ADMIN"?"warning":"info"}`}>{u.role}</span></td>
-                    <td style={{ fontSize:12,color:"rgba(255,255,255,0.35)" }}>{new Date(u.createdAt ?? "").toLocaleDateString()}</td>
-                    <td><button onClick={()=>void toggleRole(u.id,u.role)} style={{ background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.09)",borderRadius:6,color:"#C8D4E8",padding:"4px 13px",cursor:"pointer",fontSize:12,fontFamily:"DM Sans,sans-serif" }}>Make {u.role==="ADMIN"?"User":"Admin"}</button></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      ) : analytics && (
-        <div>
-          <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(170px,1fr))",gap:11,marginBottom:24 }}>
-            {([["Total Users",analytics.users?.total],["Verified",analytics.users?.verified],["Unverified",analytics.users?.unverified]] as [string,number][]).map(([l,v])=>(
-              <div key={l} className="cf-card" style={{ textAlign:"center" }}>
-                <div style={{ fontSize:38,fontFamily:"Syne,sans-serif",fontWeight:800,color:"#E85D04" }}>{v ?? 0}</div>
-                <div style={{ fontSize:12,color:"rgba(255,255,255,0.38)",marginTop:4 }}>{l}</div>
+
+      {loading ? <div style={{ textAlign:"center",padding:60 }}><Spinner /></div> : (
+
+        <>
+          {tab === "users" && users && (
+            <div className="cf-card" style={{ padding:0,overflow:"hidden" }}>
+              <div style={{ overflowX:"auto" }}>
+                <table className="cf-table">
+                  <thead><tr><th>Name</th><th>Email</th><th>Status</th><th>Role</th><th>Joined</th><th>Action</th></tr></thead>
+                  <tbody>
+                    {users.users?.map(u => (
+                      <tr key={u.id}>
+                        <td style={{ fontWeight:500 }}>{u.firstName} {u.lastName}</td>
+                        <td style={{ fontSize:12,color:"rgba(255,255,255,0.42)" }}>{u.email}</td>
+                        <td><span className={`cf-badge cf-badge-${u.isVerified?"success":"danger"}`}>{u.isVerified?"Verified":"Unverified"}</span></td>
+                        <td><span className={`cf-badge cf-badge-${u.role==="ADMIN"?"warning":"info"}`}>{u.role}</span></td>
+                        <td style={{ fontSize:12,color:"rgba(255,255,255,0.35)" }}>{new Date(u.createdAt ?? "").toLocaleDateString()}</td>
+                        <td><button onClick={()=>void toggleRole(u.id, u.role)} style={{ background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.09)",borderRadius:6,color:"#C8D4E8",padding:"4px 13px",cursor:"pointer",fontSize:12,fontFamily:"DM Sans,sans-serif" }}>Make {u.role==="ADMIN"?"User":"Admin"}</button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
+            </div>
+          )}
+
+          {tab === "analytics" && analytics && (
+            <div>
+              <h4 style={{ fontSize:11,color:"rgba(255,255,255,0.35)",letterSpacing:0.7,textTransform:"uppercase",marginBottom:13 }}>User Activity</h4>
+              <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))",gap:11,marginBottom:28 }}>
+                {([
+                  ["Total Users", analytics.users?.total, "#E85D04"],
+                  ["Verified", analytics.users?.verified, "#4EC98A"],
+                  ["Unverified", analytics.users?.unverified, "#FF7070"],
+                ] as [string,number,string][]).map(([l,v,c]) => (
+                  <div key={l} className="cf-card" style={{ textAlign:"center" }}>
+                    <div style={{ fontSize:36,fontFamily:"Syne,sans-serif",fontWeight:800,color:c }}>{v ?? 0}</div>
+                    <div style={{ fontSize:12,color:"rgba(255,255,255,0.38)",marginTop:4 }}>{l}</div>
+                  </div>
+                ))}
+              </div>
+
+              <h4 style={{ fontSize:11,color:"rgba(255,255,255,0.35)",letterSpacing:0.7,textTransform:"uppercase",marginBottom:13 }}>Trade & Transaction Volume</h4>
+              <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))",gap:11,marginBottom:28 }}>
+                {analytics.transactions?.byType?.map(t => (
+                  <div key={t.type} className="cf-card" style={{ textAlign:"center" }}>
+                    <div style={{ fontSize:36,fontFamily:"Syne,sans-serif",fontWeight:800,color:t.type==="TRADE"?"#E85D04":t.type==="CONVERSION"?"#FFB43C":"#64A0FF" }}>{parseInt(t.count)}</div>
+                    <div style={{ fontSize:12,color:"rgba(255,255,255,0.38)",marginTop:4 }}>{t.type}</div>
+                  </div>
+                ))}
+                {txByType && (
+                  <div className="cf-card" style={{ textAlign:"center" }}>
+                    <div style={{ fontSize:36,fontFamily:"Syne,sans-serif",fontWeight:800,color:"#4EC98A" }}>{allTx?.total ?? 0}</div>
+                    <div style={{ fontSize:12,color:"rgba(255,255,255,0.38)",marginTop:4 }}>Total Transactions</div>
+                  </div>
+                )}
+              </div>
+
+              {txByDay && Object.keys(txByDay).length > 0 && (
+                <>
+                  <h4 style={{ fontSize:11,color:"rgba(255,255,255,0.35)",letterSpacing:0.7,textTransform:"uppercase",marginBottom:13 }}>Daily Transaction Activity</h4>
+                  <div className="cf-card" style={{ marginBottom:28 }}>
+                    <div style={{ display:"flex",alignItems:"flex-end",gap:6,height:100,padding:"0 4px" }}>
+                      {Object.entries(txByDay).slice(-14).map(([day, count]) => {
+                        const max = Math.max(...Object.values(txByDay));
+                        const pct = max > 0 ? (count / max) * 100 : 0;
+                        return (
+                          <div key={day} style={{ flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:6 }}>
+                            <div style={{ fontSize:10,color:"rgba(255,255,255,0.4)" }}>{count}</div>
+                            <div style={{ width:"100%",background:"#E85D04",borderRadius:"4px 4px 0 0",height:`${pct}%`,minHeight:4,transition:"height 0.3s" }} />
+                            <div style={{ fontSize:9,color:"rgba(255,255,255,0.25)",whiteSpace:"nowrap",transform:"rotate(-45deg)",transformOrigin:"top center",marginTop:4 }}>{day}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {/* Recent Activity Log */}
+<h4 style={{ fontSize:11,color:"rgba(255,255,255,0.35)",letterSpacing:0.7,textTransform:"uppercase",marginBottom:13 }}>Recent Activity Log</h4>
+<div className="cf-card" style={{ padding:0,overflow:"hidden" }}>
+  <table className="cf-table">
+    <thead>
+      <tr>
+        <th>User</th>
+        <th>Email</th>
+        <th>Reference</th>
+        <th>Type</th>
+        <th>Amount</th>
+        <th>Pair</th>
+        <th>Status</th>
+        <th>Time</th>
+      </tr>
+    </thead>
+    <tbody>
+      {recentActivity.map(tx => (
+        <tr key={tx.id}>
+          <td style={{ fontWeight:500,whiteSpace:"nowrap" }}>
+            {tx.user ? `${tx.user.firstName} ${tx.user.lastName}` : "—"}
+          </td>
+          <td style={{ fontSize:11,color:"rgba(255,255,255,0.35)" }}>
+            {tx.user?.email ?? "—"}
+          </td>
+          <td style={{ fontFamily:"monospace",fontSize:10,color:"rgba(255,255,255,0.28)",maxWidth:110,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>
+            {tx.reference}
+          </td>
+          <td>
+            <span className={`cf-badge cf-badge-${tx.type==="TRADE"?"danger":tx.type==="CONVERSION"?"warning":"info"}`}>
+              {tx.type}
+            </span>
+          </td>
+          <td style={{ fontWeight:500 }}>{Number(tx.amount).toFixed(2)}</td>
+          <td style={{ fontSize:12 }}>
+            {FLAGS[tx.fromCurrency]} {tx.fromCurrency}
+            {tx.toCurrency ? ` → ${FLAGS[tx.toCurrency] ?? ""} ${tx.toCurrency}` : ""}
+          </td>
+          <td>
+            <span className={`cf-badge cf-badge-${tx.status==="SUCCESS"?"success":"danger"}`}>
+              {tx.status}
+            </span>
+          </td>
+          <td style={{ fontSize:11,color:"rgba(255,255,255,0.3)",whiteSpace:"nowrap" }}>
+            {new Date(tx.createdAt).toLocaleString("en-GB",{day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"})}
+          </td>
+        </tr>
+      ))}
+    </tbody>
+  </table>
+</div>
+            </div>
+          )}
+
+          {tab === "fx-trends" && (
+            <div>
+              <h4 style={{ fontSize:11,color:"rgba(255,255,255,0.35)",letterSpacing:0.7,textTransform:"uppercase",marginBottom:13 }}>FX Rate Snapshots — NGN Base</h4>
+              {fxTrends.length === 0 ? (
+                <div className="cf-card" style={{ textAlign:"center",padding:40,color:"rgba(255,255,255,0.28)",fontSize:14 }}>
+                  No FX snapshots yet. Rates are captured when users request them.
+                </div>
+              ) : (
+                <>
+                  <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(170px,1fr))",gap:11,marginBottom:24 }}>
+                    {fxTrends[0]?.rates && Object.entries(fxTrends[0].rates).filter(([c]) => c !== "NGN").slice(0,6).map(([currency, rate]) => (
+                      <div key={currency} className="cf-card" style={{ display:"flex",alignItems:"center",gap:12 }}>
+                        <div style={{ fontSize:26 }}>{FLAGS[currency]}</div>
+                        <div>
+                          <div style={{ fontSize:10,color:"rgba(255,255,255,0.35)",textTransform:"uppercase",letterSpacing:0.5 }}>{currency}</div>
+                          <div style={{ fontFamily:"Syne,sans-serif",fontSize:18,fontWeight:700,color:"#E85D04" }}>{rate < 0.001 ? rate.toExponential(3) : rate.toFixed(5)}</div>
+                          <div style={{ fontSize:10,color:"rgba(255,255,255,0.25)" }}>1 NGN =</div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Snapshot History */}
+                  <h4 style={{ fontSize:11,color:"rgba(255,255,255,0.35)",letterSpacing:0.7,textTransform:"uppercase",marginBottom:13 }}>Rate Snapshot History</h4>
+                  <div className="cf-card" style={{ padding:0,overflow:"hidden" }}>
+                    <div style={{ overflowX:"auto" }}>
+                      <table className="cf-table">
+                        <thead>
+                          <tr>
+                            <th>Fetched At</th>
+                            <th>USD</th>
+                            <th>EUR</th>
+                            <th>GBP</th>
+                            <th>CAD</th>
+                            <th>AUD</th>
+                            <th>ZAR</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {fxTrends.map((snap, i) => (
+                            <tr key={i}>
+                              <td style={{ fontSize:12,color:"rgba(255,255,255,0.42)",whiteSpace:"nowrap" }}>
+                                {new Date(snap.fetchedAt).toLocaleString("en-GB",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"})}
+                              </td>
+                              {["USD","EUR","GBP","CAD","AUD","ZAR"].map(c => (
+                                <td key={c} style={{ fontFamily:"monospace",fontSize:12,color:"#E85D04" }}>
+                                  {snap.rates[c] ? snap.rates[c].toFixed(5) : "—"}
+                                </td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {tab === "transactions" && (
+  <div>
+    <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:18,flexWrap:"wrap",gap:12 }}>
+      <p style={{ color:"rgba(255,255,255,0.38)",fontSize:13.5 }}>{allTx?.total ?? 0} total platform transactions</p>
+    </div>
+    <div className="cf-card" style={{ padding:0,overflow:"hidden" }}>
+      <div style={{ overflowX:"auto" }}>
+        <table className="cf-table">
+          <thead>
+            <tr>
+              <th>User</th>
+              <th>Email</th>
+              <th>Type</th>
+              <th>Amount</th>
+              <th>Converted</th>
+              <th>Rate</th>
+              <th>Status</th>
+              <th>Date</th>
+            </tr>
+          </thead>
+          <tbody>
+            {allTx?.transactions.map(tx => (
+              <tr key={tx.id}>
+                <td style={{ fontWeight:500,whiteSpace:"nowrap" }}>
+                  {tx.user ? `${tx.user.firstName} ${tx.user.lastName}` : "—"}
+                </td>
+                <td style={{ fontSize:11,color:"rgba(255,255,255,0.35)" }}>
+                  {tx.user?.email ?? "—"}
+                </td>
+                <td>
+                  <span className={`cf-badge cf-badge-${tx.type==="TRADE"?"danger":tx.type==="CONVERSION"?"warning":"info"}`}>
+                    {tx.type}
+                  </span>
+                </td>
+                <td style={{ fontWeight:500 }}>
+                  {Number(tx.amount).toFixed(2)} <span style={{ color:"rgba(255,255,255,0.4)",fontSize:11 }}>{tx.fromCurrency}</span>
+                </td>
+                <td>
+                  {tx.convertedAmount > 0
+                    ? <>{Number(tx.convertedAmount).toFixed(4)} <span style={{ color:"rgba(255,255,255,0.4)",fontSize:11 }}>{tx.toCurrency}</span></>
+                    : "—"}
+                </td>
+                <td style={{ fontFamily:"monospace",fontSize:11,color:"rgba(255,255,255,0.35)" }}>
+                  {tx.rateUsed ? Number(tx.rateUsed).toFixed(5) : "—"}
+                </td>
+                <td>
+                  <span className={`cf-badge cf-badge-${tx.status==="SUCCESS"?"success":"danger"}`}>
+                    {tx.status}
+                  </span>
+                </td>
+                <td style={{ fontSize:11,color:"rgba(255,255,255,0.35)",whiteSpace:"nowrap" }}>
+                  {new Date(tx.createdAt).toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric"})}
+                </td>
+              </tr>
             ))}
-          </div>
-        </div>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+)}
+        </>
       )}
     </div>
   );
