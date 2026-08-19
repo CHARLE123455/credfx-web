@@ -1187,9 +1187,9 @@ export default function App() {
   // Only an authentication failure invalidates the stored session; a network or
   // server outage keeps the token and offers a retry instead of signing the user out.
   const restoreSession = useCallback(async () => {
+    setBootError("");
     const token = tokenStore.read();
     if (!token) { setReady(true); return; }
-    setBootError("");
     try {
       const r = await api.get("/auth/me");
       setUser(r.data as UserProfile);
