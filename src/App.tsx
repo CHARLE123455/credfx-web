@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
+import { Component, useCallback, useEffect, useState } from "react";
+import type { ErrorInfo, ReactNode } from "react";
 
 const API_BASE = "/api/v1";
 
@@ -81,31 +82,96 @@ interface ToastState {
   type: "success" | "error";
 }
 
+const TOKEN_KEY = "credfx_token";
+const UNAUTHORIZED_EVENT = "credfx:unauthorized";
+
+class ApiError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+const getErrorMessage = (e: unknown): string => {
+  if (e instanceof Error && e.message) return e.message;
+  if (typeof e === "string" && e) return e;
+  return "Something went wrong. Please try again.";
+};
+
+// localStorage throws in private browsing modes and when storage is full,
+// so every access is guarded and reported rather than crashing a handler.
+const tokenStore = {
+  read: (): string | null => {
+    try {
+      return localStorage.getItem(TOKEN_KEY);
+    } catch (e) {
+      console.error("Unable to read the stored session token", e);
+      return null;
+    }
+  },
+  write: (token: string) => {
+    try {
+      localStorage.setItem(TOKEN_KEY, token);
+    } catch (e) {
+      throw new Error("Signed in, but the session could not be saved on this device. Check your browser storage settings.", { cause: e });
+    }
+  },
+  clear: () => {
+    try {
+      localStorage.removeItem(TOKEN_KEY);
+    } catch (e) {
+      console.error("Unable to clear the stored session token", e);
+    }
+  },
+};
+
 const apiRequest = async (endpoint: string, options: RequestOptions = {}): Promise<ApiData> => {
-  const token = localStorage.getItem("credfx_token");
+  const token = tokenStore.read();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
     ...(options.headers ?? {}),
   };
-  const res = await fetch(`${API_BASE}${endpoint}`, { ...options, headers });
-  const text = await res.text();
-  
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${endpoint}`, { ...options, headers });
+  } catch (e) {
+    throw new ApiError("Unable to reach the server. Check your connection and try again.", 0, { cause: e });
+  }
+
+  if (res.status === 401 && token) {
+    tokenStore.clear();
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+  }
+
+  let text: string;
+  try {
+    text = await res.text();
+  } catch (e) {
+    throw new ApiError("The connection dropped before the server response was complete.", res.status, { cause: e });
+  }
+
   if (!text || text.trim() === "") {
-    if (!res.ok) throw new Error(`Request failed with status ${res.status}`);
+    if (!res.ok) throw new ApiError(`Request failed with status ${res.status}`, res.status);
     return {};
   }
 
- let data: ApiData;
+  let data: ApiData;
   try {
     data = JSON.parse(text) as ApiData;
-  } catch {
-    throw new Error("Invalid response from server");
+  } catch (e) {
+    throw new ApiError(
+      res.ok ? "Invalid response from server" : `Request failed with status ${res.status}`,
+      res.status,
+      { cause: e },
+    );
   }
 
   if (!res.ok) {
-    const msg = data.message ?? "Request failed";
-    throw new Error(msg);
+    throw new ApiError(data.message ?? "Request failed", res.status);
   }
   return data;
 };
@@ -183,6 +249,38 @@ const Logo = ({ large }: { large?: boolean }) => (
 
 const Spinner = () => <span className="cf-spin" />;
 
+const ErrorState = ({ msg, onRetry }: { msg: string; onRetry?: () => void }) => (
+  <div className="cf-card" style={{ textAlign:"center",padding:36,display:"flex",flexDirection:"column",alignItems:"center",gap:14 }}>
+    <div style={{ fontSize:22 }}>⚠</div>
+    <div style={{ color:"#FF7070",fontSize:14,maxWidth:420,lineHeight:1.5 }}>{msg}</div>
+    {onRetry && <button className="cf-btn cf-btn-secondary" onClick={onRetry}>Try again</button>}
+  </div>
+);
+
+// Without a boundary a render-time throw unmounts the whole tree and leaves a blank page.
+class ErrorBoundary extends Component<{ children: ReactNode }, { message: string }> {
+  state = { message: "" };
+
+  static getDerivedStateFromError(error: unknown) {
+    return { message: getErrorMessage(error) };
+  }
+
+  componentDidCatch(error: unknown, info: ErrorInfo) {
+    console.error("Unhandled rendering error", error, info.componentStack);
+  }
+
+  render() {
+    if (!this.state.message) return this.props.children;
+    return (
+      <div className="credfx" style={{ display:"flex",alignItems:"center",justifyContent:"center",padding:24 }}>
+        <div style={{ maxWidth:460,width:"100%" }}>
+          <ErrorState msg={this.state.message} onRetry={() => this.setState({ message: "" })} />
+        </div>
+      </div>
+    );
+  }
+}
+
 const Toast = ({ msg, type, onClose }: { msg: string; type: string; onClose: () => void }) => (
   <div style={{ position:"fixed",top:22,right:22,zIndex:999,background:type==="error"?"#1C0808":"#08181A",border:`1px solid ${type==="error"?"rgba(255,112,112,0.25)":"rgba(78,201,138,0.25)"}`,color:type==="error"?"#FF7070":"#4EC98A",padding:"12px 18px",borderRadius:11,fontSize:13,fontWeight:500,display:"flex",alignItems:"center",gap:10,maxWidth:340,animation:"fadeUp 0.25s ease" }}>
     <span style={{ fontSize:15 }}>{type==="error"?"⚠":"✓"}</span>
@@ -212,8 +310,8 @@ const AuthPage = ({ onLogin }: { onLogin: (user: UserProfile) => void }) => {
       setPendingEmail(f.email);
       setSuccess((res.data as { message?: string })?.message ?? res.message ?? "OTP sent!");
       setTimeout(() => { setView("otp"); setSuccess(""); }, 1200);
-    } catch(e) { setError((e as Error).message); }
-    setLoading(false);
+    } catch(e) { setError(getErrorMessage(e)); }
+    finally { setLoading(false); }
   };
 
   const doVerify = async () => {
@@ -222,8 +320,8 @@ const AuthPage = ({ onLogin }: { onLogin: (user: UserProfile) => void }) => {
       await api.post("/auth/verify", { email:pendingEmail, otp:f.otp });
       setSuccess("Verified! Redirecting to login…");
       setTimeout(() => { setView("login"); setSuccess(""); }, 1400);
-    } catch(e) { setError((e as Error).message); }
-    setLoading(false);
+    } catch(e) { setError(getErrorMessage(e)); }
+    finally { setLoading(false); }
   };
 
   const doLogin = async () => {
@@ -231,15 +329,15 @@ const AuthPage = ({ onLogin }: { onLogin: (user: UserProfile) => void }) => {
     try {
       const res = await api.post("/auth/login", { email:f.email, password:f.password });
       const data = res.data as { accessToken: string; user: UserProfile };
-      localStorage.setItem("credfx_token", data.accessToken);
+      tokenStore.write(data.accessToken);
       onLogin(data.user);
-    } catch(e) { setError((e as Error).message); }
-    setLoading(false);
+    } catch(e) { setError(getErrorMessage(e)); }
+    finally { setLoading(false); }
   };
 
   const doResend = async () => {
     try { await api.post("/auth/resend-otp", { email:pendingEmail }); setSuccess("New OTP sent!"); }
-    catch(e) { setError((e as Error).message); }
+    catch(e) { setError(getErrorMessage(e)); }
   };
 
   const link: React.CSSProperties = { color:"#E85D04",cursor:"pointer",fontWeight:500 };
@@ -342,8 +440,8 @@ const FundModal = ({ onClose, onSuccess }: { onClose: () => void; onSuccess: (ms
   const handle = async () => {
     setLoading(true); setError("");
     try { await api.post("/wallet/fund", { amount:Number(amount), currency }); onSuccess("Wallet funded successfully!"); onClose(); }
-    catch(e) { setError((e as Error).message); }
-    setLoading(false);
+    catch(e) { setError(getErrorMessage(e)); }
+    finally { setLoading(false); }
   };
   return (
     <div className="cf-backdrop" onClick={onClose}>
@@ -381,8 +479,8 @@ const ConvertModal = ({ onClose, onSuccess, rates }: { onClose: () => void; onSu
   const handle = async () => {
     setLoading(true); setError("");
     try { await api.post("/wallet/convert", { fromCurrency:from, toCurrency:to, amount:Number(amount) }); onSuccess("Conversion successful!"); onClose(); }
-    catch(e) { setError((e as Error).message); }
-    setLoading(false);
+    catch(e) { setError(getErrorMessage(e)); }
+    finally { setLoading(false); }
   };
   return (
     <div className="cf-backdrop" onClick={onClose}>
@@ -427,8 +525,8 @@ const TradeModal = ({ onClose, onSuccess, rates }: { onClose: () => void; onSucc
   const handle = async () => {
     setLoading(true); setError("");
     try { await api.post("/wallet/trade", { sourceCurrency:source, targetCurrency:target, targetAmount:Number(targetAmt) }); onSuccess("Trade executed!"); onClose(); }
-    catch(e) { setError((e as Error).message); }
-    setLoading(false);
+    catch(e) { setError(getErrorMessage(e)); }
+    finally { setLoading(false); }
   };
   return (
     <div className="cf-backdrop" onClick={onClose}>
@@ -467,28 +565,40 @@ const Dashboard = ({ user }: { user: UserProfile }) => {
   const [wallet, setWallet] = useState<WalletData | null>(null);
   const [rates, setRates] = useState<Record<string, number> | null>(null);
   const [loading, setLoading] = useState(true);
+  const [walletError, setWalletError] = useState("");
+  const [ratesError, setRatesError] = useState("");
   const [modal, setModal] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastState | null>(null);
   const toast$ = (msg: string, type: "success"|"error" = "success") => { setToast({ msg, type }); setTimeout(()=>setToast(null), 4000); };
 
+  // Balances and rates are reported independently: a rates outage must not hide
+  // the balances, and it must not silently understate the portfolio total either.
   const load = useCallback(async () => {
     setLoading(true);
+    setWalletError(""); setRatesError("");
     try {
-      const [w, r] = await Promise.all([api.get("/wallet"), api.get("/fx/rates?base=NGN")]);
-      setWallet(w.data as WalletData);
-      setRates((r.data as RatesData)?.rates);
-    } catch(e) { console.error(e); }
-    setLoading(false);
+      const [w, r] = await Promise.allSettled([api.get("/wallet"), api.get("/fx/rates?base=NGN")]);
+      if (w.status === "fulfilled") setWallet(w.value.data as WalletData);
+      else { setWallet(null); setWalletError(getErrorMessage(w.reason)); console.error(w.reason); }
+      if (r.status === "fulfilled") setRates((r.value.data as RatesData)?.rates);
+      else { setRates(null); setRatesError(getErrorMessage(r.reason)); console.error(r.reason); }
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
   useEffect(() => { void load(); }, [load]);
 
   const balances = wallet?.balances ?? [];
+  const missingRate = balances.some(b => b.currency !== "NGN" && !rates?.[b.currency]);
   const totalNgn = balances.reduce((s, b) => {
     if (b.currency === "NGN") return s + Number(b.balance);
     const r = rates?.[b.currency]; if (!r) return s;
     return s + Number(b.balance) / r;
   }, 0);
+  const totalLabel = loading || walletError || missingRate
+    ? "—"
+    : `₦${totalNgn.toLocaleString("en-NG",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
 
   return (
     <div className="cf-fade">
@@ -503,8 +613,13 @@ const Dashboard = ({ user }: { user: UserProfile }) => {
       <div style={{ background:"linear-gradient(140deg,#0D2860 0%,#0B1A40 50%,#1A0B00 100%)",borderRadius:18,padding:28,marginBottom:22,border:"1px solid rgba(255,255,255,0.07)" }}>
         <div style={{ fontSize:11,color:"rgba(255,255,255,0.4)",letterSpacing:1,textTransform:"uppercase",marginBottom:7 }}>Total Portfolio (NGN equivalent)</div>
         <div style={{ fontFamily:"Syne,sans-serif",fontSize:40,fontWeight:800,color:"white",marginBottom:22 }}>
-          {loading ? "—" : `₦${totalNgn.toLocaleString("en-NG",{minimumFractionDigits:2,maximumFractionDigits:2})}`}
+          {totalLabel}
         </div>
+        {!loading && !walletError && missingRate && (
+          <div className="cf-error" style={{ marginTop:-14,marginBottom:16 }}>
+            Portfolio total unavailable — FX rates could not be loaded{ratesError ? `: ${ratesError}` : ""}
+          </div>
+        )}
         <div style={{ display:"flex",gap:10,flexWrap:"wrap" }}>
           {([{l:"Fund Wallet",a:"fund",primary:true},{l:"Convert",a:"convert",primary:false},{l:"Trade",a:"trade",primary:false}]).map(b=>(
             <button key={b.a} className={`cf-btn ${b.primary?"cf-btn-primary":"cf-btn-secondary"}`} onClick={()=>setModal(b.a)} style={{ padding:"9px 18px" }}>{b.l}</button>
@@ -514,6 +629,8 @@ const Dashboard = ({ user }: { user: UserProfile }) => {
       <h4 style={{ fontSize:12,color:"rgba(255,255,255,0.35)",letterSpacing:0.7,textTransform:"uppercase",marginBottom:14 }}>Currency Balances</h4>
       {loading ? (
         <div style={{ textAlign:"center",padding:40 }}><Spinner /></div>
+      ) : walletError ? (
+        <ErrorState msg={walletError} onRetry={()=>void load()} />
       ) : balances.length === 0 ? (
         <div className="cf-card" style={{ textAlign:"center",padding:36,color:"rgba(255,255,255,0.28)",fontSize:14 }}>No balances yet. Fund your wallet to get started.</div>
       ) : (
@@ -538,11 +655,12 @@ const FxRatesPage = () => {
   const [base, setBase] = useState("NGN");
   const [data, setData] = useState<RatesData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
   const load = useCallback(async () => {
-    setLoading(true);
+    setLoading(true); setError("");
     try { const r = await api.get(`/fx/rates?base=${base}`); setData(r.data as RatesData); }
-    catch(e) { console.error(e); }
-    setLoading(false);
+    catch(e) { console.error(e); setData(null); setError(getErrorMessage(e)); }
+    finally { setLoading(false); }
   }, [base]);
   useEffect(() => { void load(); }, [load]);
   const currencies = data?.rates ? Object.entries(data.rates).filter(([c])=>c!==base) : [];
@@ -561,7 +679,9 @@ const FxRatesPage = () => {
           <button className="cf-btn cf-btn-secondary" onClick={()=>void load()}>Refresh</button>
         </div>
       </div>
-      {loading ? <div style={{ textAlign:"center",padding:60 }}><Spinner /></div> : (
+      {loading ? <div style={{ textAlign:"center",padding:60 }}><Spinner /></div> : error ? (
+        <ErrorState msg={error} onRetry={()=>void load()} />
+      ) : (
         <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(210px,1fr))",gap:11 }}>
           {currencies.map(([currency, rate]) => (
             <div key={currency} className="cf-card" style={{ display:"flex",justifyContent:"space-between",alignItems:"center" }}>
@@ -587,16 +707,17 @@ const FxRatesPage = () => {
 const TransactionsPage = () => {
   const [data, setData] = useState<TransactionList | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
   const [page, setPage] = useState(1);
   const load = useCallback(async () => {
-    setLoading(true);
+    setLoading(true); setError("");
     try {
       const p = new URLSearchParams({ page: String(page), limit: "20", ...(typeFilter&&{type:typeFilter}) });
       const r = await api.get(`/transactions?${p.toString()}`);
       setData(r.data as TransactionList);
-    } catch(e) { console.error(e); }
-    setLoading(false);
+    } catch(e) { console.error(e); setData(null); setError(getErrorMessage(e)); }
+    finally { setLoading(false); }
   }, [typeFilter, page]);
   useEffect(() => { void load(); }, [load]);
   const TC: Record<string, string> = { FUNDING:"success",CONVERSION:"warning",TRADE:"danger" };
@@ -618,6 +739,7 @@ const TransactionsPage = () => {
       </div>
       <div className="cf-card" style={{ padding:0,overflow:"hidden" }}>
         {loading ? <div style={{ textAlign:"center",padding:48 }}><Spinner /></div>
+        : error ? <ErrorState msg={error} onRetry={()=>void load()} />
         : !data?.transactions?.length ? <div style={{ textAlign:"center",padding:44,color:"rgba(255,255,255,0.28)",fontSize:14 }}>No transactions found</div>
         : (
           <div style={{ overflowX:"auto" }}>
@@ -658,11 +780,12 @@ const AdminPage = () => {
   const [fxTrends, setFxTrends] = useState<Array<{baseCurrency: string; rates: Record<string,number>; fetchedAt: string}>>([]);
   const [allTx, setAllTx] = useState<TransactionList | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
   const [toast, setToast] = useState<ToastState | null>(null);
   const toast$ = (msg: string, type: "success"|"error" = "success") => { setToast({msg,type}); setTimeout(()=>setToast(null),3500); };
 
   const load = useCallback(async () => {
-    setLoading(true);
+    setLoading(true); setError("");
     try {
       if (tab === "users") {
         const r = await api.get("/admin/users?page=1&limit=50");
@@ -701,8 +824,8 @@ const AdminPage = () => {
   const tx = await api.get("/admin/transactions?limit=100");
   setAllTx(tx.data as TransactionList);
 }
-    } catch(e) { console.error(e); }
-    setLoading(false);
+    } catch(e) { console.error(e); setError(getErrorMessage(e)); }
+    finally { setLoading(false); }
   }, [tab]);
 
   useEffect(() => { void load(); }, [load]);
@@ -710,7 +833,7 @@ const AdminPage = () => {
   const toggleRole = async (id: string, currentRole: string) => {
     const newRole = currentRole === "ADMIN" ? "USER" : "ADMIN";
     try { await api.patch(`/admin/users/${id}/role`, { role: newRole }); toast$(`Role updated to ${newRole}`); void load(); }
-    catch(e) { toast$((e as Error).message, "error"); }
+    catch(e) { toast$(getErrorMessage(e), "error"); }
   };
 
   const tabs = [
@@ -747,7 +870,9 @@ const AdminPage = () => {
         ))}
       </div>
 
-      {loading ? <div style={{ textAlign:"center",padding:60 }}><Spinner /></div> : (
+      {loading ? <div style={{ textAlign:"center",padding:60 }}><Spinner /></div> : error ? (
+        <ErrorState msg={error} onRetry={()=>void load()} />
+      ) : (
 
         <>
           {tab === "users" && users && (
@@ -1057,24 +1182,40 @@ const MainApp = ({ user, onLogout }: { user: UserProfile; onLogout: () => void }
 export default function App() {
   const [user, setUser] = useState<UserProfile | null>(null);
   const [ready, setReady] = useState(false);
+  const [bootError, setBootError] = useState("");
+
+  // Only an authentication failure invalidates the stored session; a network or
+  // server outage keeps the token and offers a retry instead of signing the user out.
+  const restoreSession = useCallback(async () => {
+    const token = tokenStore.read();
+    if (!token) { setReady(true); return; }
+    setBootError("");
+    try {
+      const r = await api.get("/auth/me");
+      setUser(r.data as UserProfile);
+    } catch (e) {
+      console.error("Could not restore the previous session", e);
+      if (e instanceof ApiError && e.status >= 400 && e.status < 500) {
+        tokenStore.clear();
+        setUser(null);
+      } else {
+        setBootError(getErrorMessage(e));
+      }
+    } finally {
+      setReady(true);
+    }
+  }, []);
 
   useEffect(() => {
-  injectStyles();
-  const token = localStorage.getItem("credfx_token");
-  if (token) {
-    api.get("/auth/me")
-      .then(r => {
-        setUser(r.data as UserProfile);
-        setReady(true);
-      })
-      .catch(() => {
-        localStorage.removeItem("credfx_token");
-        setReady(true);
-      });
-  } else {
-    setTimeout(() => setReady(true), 0);
-  }
-}, []);
+    injectStyles();
+    void restoreSession();
+  }, [restoreSession]);
+
+  useEffect(() => {
+    const onUnauthorized = () => { setUser(null); setBootError("Your session expired. Please sign in again."); };
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+  }, []);
 
   if (!ready) return (
     <div style={{ background:"#070F24",minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center" }}>
@@ -1082,7 +1223,25 @@ export default function App() {
     </div>
   );
 
-  return user
-    ? <MainApp user={user} onLogout={() => { localStorage.removeItem("credfx_token"); setUser(null); }} />
-    : <AuthPage onLogin={u => setUser(u)} />;
+  if (!user && bootError) return (
+    <div className="credfx" style={{ display:"flex",alignItems:"center",justifyContent:"center",padding:24 }}>
+      <div style={{ maxWidth:460,width:"100%" }}>
+        <ErrorState
+          msg={bootError}
+          onRetry={() => { setReady(false); void restoreSession(); }}
+        />
+        <div style={{ textAlign:"center",marginTop:14 }}>
+          <button className="cf-btn cf-btn-secondary" onClick={() => { tokenStore.clear(); setBootError(""); }}>Sign in again</button>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <ErrorBoundary>
+      {user
+        ? <MainApp user={user} onLogout={() => { tokenStore.clear(); setUser(null); }} />
+        : <AuthPage onLogin={u => setUser(u)} />}
+    </ErrorBoundary>
+  );
 }
