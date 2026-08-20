@@ -1,19 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-
-const API_BASE = "/api/v1";
-
-interface RequestOptions {
-  method?: string;
-  body?: string;
-  headers?: Record<string, string>;
-}
-
-interface ApiData {
-  message?: string;
-  data?: unknown;
-  accessToken?: string;
-  user?: UserProfile;
-}
+import { api, TOKEN_KEY } from "./lib/api";
+import { FLAGS, NAMES } from "./lib/currencies";
 
 interface UserProfile {
   createdAt: string;
@@ -81,41 +68,6 @@ interface ToastState {
   type: "success" | "error";
 }
 
-const apiRequest = async (endpoint: string, options: RequestOptions = {}): Promise<ApiData> => {
-  const token = localStorage.getItem("credfx_token");
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    ...(options.headers ?? {}),
-  };
-  const res = await fetch(`${API_BASE}${endpoint}`, { ...options, headers });
-  const text = await res.text();
-  
-  if (!text || text.trim() === "") {
-    if (!res.ok) throw new Error(`Request failed with status ${res.status}`);
-    return {};
-  }
-
- let data: ApiData;
-  try {
-    data = JSON.parse(text) as ApiData;
-  } catch {
-    throw new Error("Invalid response from server");
-  }
-
-  if (!res.ok) {
-    const msg = data.message ?? "Request failed";
-    throw new Error(msg);
-  }
-  return data;
-};
-
-const api = {
-  get: (url: string) => apiRequest(url),
-  post: (url: string, body: unknown) => apiRequest(url, { method: "POST", body: JSON.stringify(body) }),
-  patch: (url: string, body: unknown) => apiRequest(url, { method: "PATCH", body: JSON.stringify(body) }),
-};
-
 const injectStyles = () => {
   if (document.getElementById("credfx-styles")) return;
   const link = document.createElement("link");
@@ -166,9 +118,6 @@ const injectStyles = () => {
   `;
   document.head.appendChild(style);
 };
-
-const FLAGS: Record<string, string> = { NGN:"🇳🇬",USD:"🇺🇸",EUR:"🇪🇺",GBP:"🇬🇧",CAD:"🇨🇦",AUD:"🇦🇺",JPY:"🇯🇵",CHF:"🇨🇭",CNY:"🇨🇳",ZAR:"🇿🇦" };
-const NAMES: Record<string, string> = { NGN:"Nigerian Naira",USD:"US Dollar",EUR:"Euro",GBP:"British Pound",CAD:"Canadian Dollar",AUD:"Australian Dollar",JPY:"Japanese Yen",CHF:"Swiss Franc",CNY:"Chinese Yuan",ZAR:"South African Rand" };
 
 const Logo = ({ large }: { large?: boolean }) => (
   <div style={{ display:"flex",alignItems:"center",gap:9 }}>
@@ -231,7 +180,7 @@ const AuthPage = ({ onLogin }: { onLogin: (user: UserProfile) => void }) => {
     try {
       const res = await api.post("/auth/login", { email:f.email, password:f.password });
       const data = res.data as { accessToken: string; user: UserProfile };
-      localStorage.setItem("credfx_token", data.accessToken);
+      localStorage.setItem(TOKEN_KEY, data.accessToken);
       onLogin(data.user);
     } catch(e) { setError((e as Error).message); }
     setLoading(false);
@@ -1060,7 +1009,7 @@ export default function App() {
 
   useEffect(() => {
   injectStyles();
-  const token = localStorage.getItem("credfx_token");
+  const token = localStorage.getItem(TOKEN_KEY);
   if (token) {
     api.get("/auth/me")
       .then(r => {
@@ -1068,7 +1017,7 @@ export default function App() {
         setReady(true);
       })
       .catch(() => {
-        localStorage.removeItem("credfx_token");
+        localStorage.removeItem(TOKEN_KEY);
         setReady(true);
       });
   } else {
@@ -1083,6 +1032,6 @@ export default function App() {
   );
 
   return user
-    ? <MainApp user={user} onLogout={() => { localStorage.removeItem("credfx_token"); setUser(null); }} />
+    ? <MainApp user={user} onLogout={() => { localStorage.removeItem(TOKEN_KEY); setUser(null); }} />
     : <AuthPage onLogin={u => setUser(u)} />;
 }
